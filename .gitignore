@@ -1,0 +1,16 @@
+# 本地构建产物(用 build.cmd 重新生成)
+/tscp
+/tscp.exe
+/tscp-linux-*
+
+# 注意: /binaries/ 必须提交到仓库 —— npx maocatooo/tscp 从 GitHub 安装时要用
+
+# npm
+*.tgz
+node_modules/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store

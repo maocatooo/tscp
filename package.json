@@ -1,0 +1,28 @@
+{
+  "name": "@maocat/tscp",
+  "version": "0.1.0",
+  "description": "SSH(SFTP) 文件上传 TUI 小工具: 浏览远程目录, 拖拽/粘贴文件批量上传",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maocatooo/tscp.git"
+  },
+  "bin": {
+    "tscp": "bin/tscp.js"
+  },
+  "files": [
+    "bin/",
+    "binaries/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "keywords": [
+    "ssh",
+    "sftp",
+    "upload",
+    "tui",
+    "scp"
+  ]
+}
