@@ -34,6 +34,14 @@ func readClipboardPaths() ([]string, error) {
 	return parsePathLines(text), nil
 }
 
+// peekClipboard 无副作用探测剪贴板(非 Windows 平台无轮询, 仅文本)
+func peekClipboard() (paths []string, image bool) {
+	if text, err := clipboard.ReadAll(); err == nil {
+		return parsePathLines(text), false
+	}
+	return nil, false
+}
+
 var errWSLClipboard = wslClipboardError{}
 
 type wslClipboardError struct{}
@@ -43,7 +51,7 @@ func (wslClipboardError) Error() string {
 }
 
 // readWSLClipboard 通过 powershell.exe 读 Windows 剪贴板:
-// 先取文件列表(资源管理器 Ctrl+C 的内容), 没有再取文本
+// 先取文件列表(资源管理器 Ctrl+C 的内容), 再取截图, 最后取文本
 func readWSLClipboard() ([]string, bool) {
 	ps := findPowerShell()
 	if ps == "" {
@@ -54,10 +62,26 @@ func readWSLClipboard() ([]string, bool) {
 			return paths, true
 		}
 	}
+	// 截图: 让 Windows 侧把剪贴板图片存成 PNG 临时文件, 再转成 WSL 路径
+	if out, err := runPS(ps, `try{$p=Join-Path $env:TEMP 'tscp_screenshot.png';(Get-Clipboard -Format Image).Save($p,[System.Drawing.Imaging.ImageFormat]::Png);Write-Output $p}catch{}`); err == nil {
+		if p := firstLine(out); p != "" {
+			return []string{winToWSLPath(p)}, true
+		}
+	}
 	if out, err := runPS(ps, "Get-Clipboard"); err == nil {
 		return parsePathLines(out), true
 	}
 	return nil, false
+}
+
+// firstLine 取第一行非空文本
+func firstLine(text string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 // findPowerShell 找到 WSL interop 的 powershell.exe

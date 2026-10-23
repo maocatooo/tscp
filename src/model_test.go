@@ -1,6 +1,9 @@
 package tscp
 
 import (
+	"bytes"
+	"encoding/binary"
+	"image/png"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -139,6 +142,26 @@ func TestLooksLikePathTextUnix(t *testing.T) {
 	}
 	if looksLikePathText("hello world") {
 		t.Fatal("普通文本不应识别为路径")
+	}
+}
+
+func TestDibToPNG(t *testing.T) {
+	// 构造 1x1 24bpp 的 DIB(BITMAPINFOHEADER + 4 字节像素行)
+	dib := make([]byte, 40+4)
+	binary.LittleEndian.PutUint32(dib[0:4], 40)  // biSize
+	binary.LittleEndian.PutUint32(dib[4:8], 1)   // biWidth
+	binary.LittleEndian.PutUint32(dib[8:12], 1)  // biHeight
+	binary.LittleEndian.PutUint16(dib[12:14], 1) // biPlanes
+	binary.LittleEndian.PutUint16(dib[14:16], 24)
+	dib[40], dib[41], dib[42] = 0xFF, 0x80, 0x00 // BGR 像素(末字节为行填充)
+
+	pngData, ok := dibToPNG(dib)
+	if !ok {
+		t.Fatal("DIB 转 PNG 失败")
+	}
+	img, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil || img.Bounds().Dx() != 1 || img.Bounds().Dy() != 1 {
+		t.Fatalf("PNG 解码: %v %v", img, err)
 	}
 }
 

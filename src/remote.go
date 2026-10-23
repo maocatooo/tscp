@@ -195,6 +195,16 @@ func (r *Remote) ListDir(dir string) ([]Entry, error) {
 	return entries, nil
 }
 
+// Mkdir 临时建连在远端创建目录(递归)
+func (r *Remote) Mkdir(dir string) error {
+	b, err := r.dial()
+	if err != nil {
+		return err
+	}
+	defer b.close()
+	return b.MkdirAll(dir)
+}
+
 // OpenBatch 为一批上传建立一条临时连接, 整批结束后由调用方 Close
 func (r *Remote) OpenBatch() (*batch, error) {
 	return r.dial()

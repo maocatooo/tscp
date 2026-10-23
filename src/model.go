@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/truncate"
@@ -86,7 +88,15 @@ type dropSettleMsg struct{} // 按键字符流已静止, 可以尝试识别路�
 
 type clipPollMsg struct{ seq uint32 } // 剪贴板序号轮询
 
-type clipHintMsg struct{ paths []string } // 剪贴板里检测到的文件(仅提示, 不自动入队)
+type clipHintMsg struct { // 剪贴板里检测到的内容(仅提示, 不自动入队)
+	paths []string
+	image bool
+}
+
+type mkdirDoneMsg struct { // 远程目录创建结果
+	dir string
+	err error
+}
 
 // ---- 样式 ----
 
@@ -116,10 +126,12 @@ type model struct {
 	qcursor int
 	nextID  int
 
-	focus     focusZone
-	uploading bool
-	ch        chan tea.Msg
-	progress  progress.Model
+	focus       focusZone
+	uploading   bool
+	ch          chan tea.Msg
+	progress    progress.Model
+	mkdirInput  textinput.Model
+	creatingDir bool // 正在输入新目录名
 
 	speed    float64 // 当前文件的上传速度 bytes/s
 	lastID   int
@@ -140,15 +152,20 @@ type model struct {
 }
 
 func NewModel(r *Remote, startDir string, cache *tscpCache, key string) model {
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.Placeholder = "目录名, 可多级如 logs/2026"
+	ti.CharLimit = 200
 	return model{
-		r:        r,
-		cwd:      startDir,
-		progress: progress.New(progress.WithDefaultGradient()),
-		status:   "目录加载中…",
-		lastID:   -1,
-		clipSeq:  clipboardSequence(),
-		cache:    cache,
-		cacheKey: key,
+		r:          r,
+		cwd:        startDir,
+		progress:   progress.New(progress.WithDefaultGradient()),
+		status:     "目录加载中…",
+		lastID:     -1,
+		clipSeq:    clipboardSequence(),
+		cache:      cache,
+		cacheKey:   key,
+		mkdirInput: ti,
 	}
 }
 
@@ -188,9 +205,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.progress.Width = max(10, msg.Width-6)
+		m.mkdirInput.Width = max(20, msg.Width-30)
 
 	case tea.KeyMsg:
+		if m.creatingDir {
+			return m.handleMkdirKey(msg)
+		}
 		return m.handleKey(msg)
+
+	case mkdirDoneMsg:
+		if msg.err != nil {
+			m.status = "创建目录失败: " + msg.err.Error()
+			return m, nil
+		}
+		m.status = "已创建并进入 " + msg.dir
+		return m, m.cdCmd(msg.dir)
+
+	case cursor.BlinkMsg:
+		if m.creatingDir {
+			var cmd tea.Cmd
+			m.mkdirInput, cmd = m.mkdirInput.Update(msg)
+			return m, cmd
+		}
 
 	case dirLoadedMsg:
 		if msg.err != nil {
@@ -262,18 +298,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.seq == 0 || msg.seq == m.clipSeq {
 			return m, next
 		}
-		// 剪贴板变了: 若里面是文件/存在的路径, 只提示, 由用户按 v 决定是否入队
+		// 剪贴板变了: 文件/截图/存在的路径只提示, 由用户按 v 决定是否入队
 		m.clipSeq = msg.seq
 		return m, tea.Batch(next, func() tea.Msg {
-			paths, err := readClipboardPaths()
-			if err != nil {
-				return clipHintMsg{}
+			paths, image := peekClipboard()
+			if image && len(filterExisting(paths)) == 0 {
+				return clipHintMsg{image: true}
 			}
 			return clipHintMsg{paths: filterExisting(paths)}
 		})
 
 	case clipHintMsg:
-		if len(msg.paths) > 0 {
+		switch {
+		case msg.image:
+			m.status = "检测到剪贴板截图 — 按 v 保存为图片文件并加入队列"
+		case len(msg.paths) > 0:
 			name := filepath.Base(msg.paths[0])
 			if r := []rune(name); len(r) > 40 {
 				name = string(r[:40]) + "…"
@@ -380,7 +419,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return queueMsg{notice: "读取剪贴板失败: " + err.Error()}
 			}
 			if len(paths) == 0 {
-				return queueMsg{notice: "剪贴板里没有文件或路径"}
+				return queueMsg{notice: "剪贴板里没有文件/截图/路径"}
 			}
 			return buildQueueMsg(paths, cwd)
 		}
@@ -430,11 +469,42 @@ func (m model) dirKeys(k string) (tea.Model, tea.Cmd) {
 		if m.cwd != "/" {
 			return m, m.cdCmd(path.Dir(m.cwd))
 		}
+	case "m":
+		m.creatingDir = true
+		m.mkdirInput.SetValue("")
+		return m, m.mkdirInput.Focus()
 	case "r":
 		return m, m.cdCmd(m.cwd)
 	}
 	m.cursor = clamp(m.cursor, 0, len(m.entries)) // +1 是固定首行 ".."
 	return m, nil
+}
+
+// handleMkdirKey 新建目录输入模式的按键: 回车创建, Esc/Ctrl+C 取消, 其余交给输入框
+func (m model) handleMkdirKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter", "ctrl+m":
+		name := strings.TrimSpace(m.mkdirInput.Value())
+		m.creatingDir = false
+		if name == "" {
+			m.status = "已取消"
+			return m, nil
+		}
+		dir := name
+		if !strings.HasPrefix(name, "/") {
+			dir = path.Join(m.cwd, name)
+		}
+		m.status = "创建目录 " + dir + " …"
+		r := m.r
+		return m, func() tea.Msg { return mkdirDoneMsg{dir: dir, err: r.Mkdir(dir)} }
+	case "esc", "ctrl+c":
+		m.creatingDir = false
+		m.status = "已取消新建目录"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.mkdirInput, cmd = m.mkdirInput.Update(msg)
+	return m, cmd
 }
 
 func (m model) enterDir() (tea.Model, tea.Cmd) {
@@ -529,7 +599,7 @@ func (m *model) startUpload() tea.Cmd {
 // bindingKeys 是会被 TUI 消费的单字母按键; 其余字母允许进入粘贴累积缓冲
 var bindingKeys = map[string]bool{
 	"u": true, "c": true, "v": true, "q": true, "g": true, "G": true,
-	"j": true, "k": true, "h": true, "l": true, "x": true, "r": true,
+	"j": true, "k": true, "h": true, "l": true, "x": true, "r": true, "m": true,
 }
 
 // pathCommitted 判断已累积的字符是否呈现本地路径特征(盘符冒号/反斜杠/引号/斜杠开头)
@@ -679,6 +749,9 @@ func (m model) View() string {
 	if m.uploading {
 		footH = 3
 	}
+	if m.creatingDir {
+		footH++
+	}
 	bodyH := max(8, h-1-footH)
 	dirH := max(5, bodyH*2/5)
 	queueH := max(4, bodyH-dirH)
@@ -688,8 +761,12 @@ func (m model) View() string {
 	if m.uploading {
 		foot = append(foot, m.progressLine(w))
 	}
+	if m.creatingDir {
+		foot = append(foot, " 新建目录: "+m.mkdirInput.View()+
+			stDim.Render("  (回车创建 · Esc 取消 · /开头为绝对路径)"))
+	}
 	foot = append(foot, " "+truncate.StringWithTail(m.status, uint(max(1, w-1)), "…"))
-	foot = append(foot, stDim.Render(" 拖拽/粘贴路径 · 复制文件后按 v 入队 · u 上传 · Tab 切换 · q 退出  |  目录: →进入 ←返回 r 刷新 · 队列: ↑↓ x 移除 c 清空"))
+	foot = append(foot, stDim.Render(" 拖拽/粘贴路径 · 复制文件/截图后按 v 入队 · u 上传 · Tab 切换 · q 退出  |  目录: →进入 ←返回 m 新建 r 刷新 · 队列: ↑↓ x 移除 c 清空"))
 
 	return lipgloss.JoinVertical(lipgloss.Left, header,
 		m.dirView(innerW, dirH-2),
