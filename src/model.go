@@ -130,6 +130,7 @@ type model struct {
 	uploading   bool
 	ch          chan tea.Msg
 	progress    progress.Model
+	autoUpload  bool // 开启后文件入队即自动上传
 	mkdirInput  textinput.Model
 	creatingDir bool // 正在输入新目录名
 
@@ -156,6 +157,7 @@ func NewModel(r *Remote, startDir string, cache *tscpCache, key string) model {
 	ti.Prompt = ""
 	ti.Placeholder = "目录名, 可多级如 logs/2026"
 	ti.CharLimit = 200
+	auto := cache != nil && cache.AutoUpload
 	return model{
 		r:          r,
 		cwd:        startDir,
@@ -165,6 +167,7 @@ func NewModel(r *Remote, startDir string, cache *tscpCache, key string) model {
 		clipSeq:    clipboardSequence(),
 		cache:      cache,
 		cacheKey:   key,
+		autoUpload: auto,
 		mkdirInput: ti,
 	}
 }
@@ -278,6 +281,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = msg.notice
 			}
 		}
+		// 自动上传: 新入队且当前空闲, 立即开始
+		if added > 0 && m.autoUpload && !m.uploading {
+			cmd := m.startUpload()
+			return m, cmd
+		}
 
 	case uploadMsg:
 		return m.handleUploadMsg(msg)
@@ -285,7 +293,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case uploadFinishedMsg:
 		m.uploading = false
 		m.status = "上传结束, 目录已刷新"
-		return m, m.cdCmd(m.cwd)
+		cmds := []tea.Cmd{m.cdCmd(m.cwd)}
+		// 自动上传: 上一批结束后队列里还有等待项就继续
+		if m.autoUpload && hasPending(m.queue) {
+			m.status = "上一批完成, 继续自动上传剩余文件"
+			cmds = append(cmds, m.startUpload())
+		}
+		return m, tea.Batch(cmds...)
 
 	case dropSettleMsg:
 		if m.pasteBuf != "" && time.Since(m.pasteLast) >= 400*time.Millisecond {
@@ -431,6 +445,23 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusDir
 		}
 		m.qcursor = clamp(m.qcursor, 0, max(0, len(m.queue)-1))
+		return m, nil
+
+	case "a":
+		m.autoUpload = !m.autoUpload
+		if m.cache != nil {
+			m.cache.AutoUpload = m.autoUpload
+			saveCache(m.cache)
+		}
+		if !m.autoUpload {
+			m.status = "自动上传已关闭, 上传需按 u"
+			return m, nil
+		}
+		m.status = "自动上传已开启: 入队即传 (再按 a 关闭)"
+		if !m.uploading && hasPending(m.queue) {
+			cmd := m.startUpload()
+			return m, cmd
+		}
 		return m, nil
 
 	case "u":
@@ -599,7 +630,17 @@ func (m *model) startUpload() tea.Cmd {
 // bindingKeys 是会被 TUI 消费的单字母按键; 其余字母允许进入粘贴累积缓冲
 var bindingKeys = map[string]bool{
 	"u": true, "c": true, "v": true, "q": true, "g": true, "G": true,
-	"j": true, "k": true, "h": true, "l": true, "x": true, "r": true, "m": true,
+	"j": true, "k": true, "h": true, "l": true, "x": true, "r": true, "m": true, "a": true,
+}
+
+// hasPending 队列里是否还有等待上传的项
+func hasPending(q []queueItem) bool {
+	for _, it := range q {
+		if it.status == stWait {
+			return true
+		}
+	}
+	return false
 }
 
 // pathCommitted 判断已累积的字符是否呈现本地路径特征(盘符冒号/反斜杠/引号/斜杠开头)
@@ -766,7 +807,7 @@ func (m model) View() string {
 			stDim.Render("  (回车创建 · Esc 取消 · /开头为绝对路径)"))
 	}
 	foot = append(foot, " "+truncate.StringWithTail(m.status, uint(max(1, w-1)), "…"))
-	foot = append(foot, stDim.Render(" 拖拽/粘贴路径 · 复制文件/截图后按 v 入队 · u 上传 · Tab 切换 · q 退出  |  目录: →进入 ←返回 m 新建 r 刷新 · 队列: ↑↓ x 移除 c 清空"))
+	foot = append(foot, stDim.Render(" 拖拽/粘贴路径 · 复制文件/截图后按 v 入队 · u 立即上传 · a 自动上传开关 · Tab 切换 · q 退出  |  目录: →进入 ←返回 m 新建 r 刷新 · 队列: ↑↓ x 移除 c 清空"))
 
 	return lipgloss.JoinVertical(lipgloss.Left, header,
 		m.dirView(innerW, dirH-2),
@@ -842,7 +883,11 @@ func (m model) queueView(innerW, n int) string {
 	var lines []string
 
 	if len(m.queue) == 0 {
-		lines = append(lines, stDim.Render(" (空) 拖拽文件 / 粘贴路径 / 复制文件后按 v, 均可加入队列"+strings.Repeat(" ", 4)))
+		if m.autoUpload {
+			lines = append(lines, stDim.Render(" (空) 自动上传已开: 加入队列即开始上传"+strings.Repeat(" ", 4)))
+		} else {
+			lines = append(lines, stDim.Render(" (空) 拖拽文件 / 粘贴路径 / 复制文件后按 v, 均可加入队列"+strings.Repeat(" ", 4)))
+		}
 	} else {
 		done, fail := 0, 0
 		for _, it := range m.queue {
@@ -853,7 +898,11 @@ func (m model) queueView(innerW, n int) string {
 				fail++
 			}
 		}
-		lines = append(lines, stDim.Render(fmt.Sprintf(" %d 项 · ✔ %d · ✘ %d", len(m.queue), done, fail)))
+		autoMark := stDim.Render("自动上传:关")
+		if m.autoUpload {
+			autoMark = stOK.Render("自动上传:开")
+		}
+		lines = append(lines, autoMark+"  "+stDim.Render(fmt.Sprintf("%d 项 · ✔ %d · ✘ %d", len(m.queue), done, fail)))
 	}
 
 	rows := m.queue

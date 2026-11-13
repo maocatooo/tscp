@@ -92,11 +92,15 @@ func TestCacheRoundTrip(t *testing.T) {
 
 	c.Last = "root@10.10.10.3:22"
 	c.Dirs[CacheKey("root", "10.10.10.3", 22)] = "/data/www"
+	c.AutoUpload = true
 	saveCache(c)
 
 	got := LoadCache()
 	if got.Last != "root@10.10.10.3:22" || got.Dirs["root@10.10.10.3:22"] != "/data/www" {
 		t.Fatalf("缓存读写不一致: %+v", got)
+	}
+	if !got.AutoUpload {
+		t.Fatal("自动上传开关未持久化")
 	}
 }
 

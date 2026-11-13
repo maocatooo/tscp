@@ -12,8 +12,9 @@ import (
 
 // tscpCache 记录上次的目标机与浏览目录, 存于 ~/.tscp/cache.json
 type tscpCache struct {
-	Last string            `json:"last"` // 上次目标, 格式 user@host:port
-	Dirs map[string]string `json:"dirs"` // user@host:port -> 上次浏览的远程目录
+	Last       string            `json:"last"`                  // 上次目标, 格式 user@host:port
+	Dirs       map[string]string `json:"dirs"`                  // user@host:port -> 上次浏览的远程目录
+	AutoUpload bool              `json:"auto_upload,omitempty"` // 自动上传开关
 }
 
 var cacheMu sync.Mutex
